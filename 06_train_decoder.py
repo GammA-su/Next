@@ -1,9 +1,10 @@
 import os
 import json
+import hashlib
 from typing import List
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
@@ -15,6 +16,7 @@ from transformers import (
 from utils import seed_all, save_json
 
 TRAIN_PATH = os.environ.get("TRAIN_PATH", "data/decoder_train.jsonl")
+VAL_PATH = os.environ.get("VAL_PATH", "data/decoder_val.jsonl")
 OUT_DIR = os.environ.get("OUT_DIR", "out/decoder")
 MODEL = os.environ.get("MODEL", "google/flan-t5-small")
 MAX_IN = int(os.environ.get("MAX_IN", "512"))
@@ -24,6 +26,15 @@ CODE_MODE = os.environ.get("CODE_MODE", "special")  # special | text | none
 K = int(os.environ.get("K", "8"))
 V = int(os.environ.get("V", "1024"))
 ADD_SPECIAL_TOKENS = os.environ.get("ADD_SPECIAL_TOKENS", "1") == "1"
+
+NUM_PROC = int(os.environ.get("NUM_PROC", "0"))
+CACHE_TOKENIZED = os.environ.get("CACHE_TOKENIZED", "1") == "1"
+TOKENIZED_CACHE_DIR = os.environ.get(
+    "TOKENIZED_CACHE_DIR", "out/cache/tokenized_decoder"
+)
+KEEP_IN_MEMORY = os.environ.get("KEEP_IN_MEMORY", "0") == "1"
+PRETOKENIZE_ONLY = os.environ.get("PRETOKENIZE_ONLY", "0") == "1"
+MAP_BATCH_SIZE = int(os.environ.get("MAP_BATCH_SIZE", "1000"))
 
 NUM_EPOCHS = int(os.environ.get("NUM_EPOCHS", "1"))
 LR = float(os.environ.get("LR", "2e-5"))
@@ -83,11 +94,48 @@ def format_prompt(ctx_text: str, codes: List[int]) -> str:
     raise ValueError(f"Unknown CODE_MODE: {CODE_MODE}")
 
 
-def main():
-    seed_all(SEED, deterministic=DETERMINISTIC)
+def file_signature(path: str) -> dict:
+    stat = os.stat(path)
+    return {
+        "path": os.path.abspath(path),
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+    }
 
+
+def compute_cache_key(
+    train_path: str,
+    val_path: str,
+    tokenizer_name: str,
+    vocab_size: int,
+    code_mode: str,
+    k: int,
+    v: int,
+    add_special_tokens: bool,
+    max_in: int,
+    max_out: int,
+    max_rows: int,
+) -> str:
+    payload = {
+        "train": file_signature(train_path),
+        "val": file_signature(val_path),
+        "tokenizer_name": tokenizer_name,
+        "vocab_size": vocab_size,
+        "code_mode": code_mode,
+        "k": k,
+        "v": v,
+        "add_special_tokens": add_special_tokens,
+        "max_in": max_in,
+        "max_out": max_out,
+        "max_rows": max_rows,
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_decoder_rows(path: str, max_rows: int) -> List[dict]:
     rows = []
-    with open(TRAIN_PATH, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
             ctx_text = r["ctx_text"]
@@ -97,10 +145,40 @@ def main():
                 codes = parse_codes_str(r.get("tgt_codes_str", ""))
             inp = format_prompt(ctx_text, codes)
             rows.append({"input": inp, "target": tgt_text})
-            if MAX_ROWS > 0 and len(rows) >= MAX_ROWS:
+            if max_rows > 0 and len(rows) >= max_rows:
                 break
+    return rows
 
-    ds = Dataset.from_list(rows)
+
+def tokenize_batch(batch, tokenizer, max_in: int, max_out: int) -> dict:
+    x = tokenizer(
+        batch["input"],
+        padding="max_length",
+        truncation=True,
+        max_length=max_in,
+    )
+    y = tokenizer(
+        batch["target"],
+        padding="max_length",
+        truncation=True,
+        max_length=max_out,
+    )
+    x["labels"] = y["input_ids"]
+    return x
+
+
+def main():
+    seed_all(SEED, deterministic=DETERMINISTIC)
+
+    num_proc = NUM_PROC
+    if os.name == "nt" and num_proc > 0:
+        print("NUM_PROC>0 is not supported on Windows; falling back to 0.")
+        num_proc = 0
+
+    train_rows = load_decoder_rows(TRAIN_PATH, MAX_ROWS)
+    val_rows = load_decoder_rows(VAL_PATH, -1)
+    train_ds = Dataset.from_list(train_rows)
+    val_ds = Dataset.from_list(val_rows)
     tok = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
 
@@ -111,13 +189,82 @@ def main():
         if tokens_added > 0:
             model.resize_token_embeddings(len(tok))
 
-    def tok_fn(batch):
-        x = tok(batch["input"], truncation=True, max_length=MAX_IN)
-        y = tok(batch["target"], truncation=True, max_length=MAX_OUT)
-        x["labels"] = y["input_ids"]
-        return x
+    cache_key = compute_cache_key(
+        TRAIN_PATH,
+        VAL_PATH,
+        tok.name_or_path,
+        len(tok),
+        CODE_MODE,
+        K,
+        V,
+        ADD_SPECIAL_TOKENS,
+        MAX_IN,
+        MAX_OUT,
+        MAX_ROWS,
+    )
+    cache_root = os.path.join(TOKENIZED_CACHE_DIR, cache_key)
+    train_cache_dir = os.path.join(cache_root, "train")
+    val_cache_dir = os.path.join(cache_root, "val")
 
-    ds = ds.map(tok_fn, batched=True, remove_columns=ds.column_names)
+    print(
+        "Tokenization setup: "
+        f"train_rows={len(train_ds)}, val_rows={len(val_ds)}, "
+        f"NUM_PROC={num_proc}, MAP_BATCH_SIZE={MAP_BATCH_SIZE}, "
+        f"cache_key={cache_key}, cache_dir={cache_root}"
+    )
+
+    cache_hit = False
+    if CACHE_TOKENIZED and os.path.isdir(train_cache_dir) and os.path.isdir(val_cache_dir):
+        try:
+            print(f"Tokenized cache hit: loading from {cache_root}")
+            train_ds = load_from_disk(train_cache_dir, keep_in_memory=KEEP_IN_MEMORY)
+            val_ds = load_from_disk(val_cache_dir, keep_in_memory=KEEP_IN_MEMORY)
+            cache_hit = True
+        except Exception as exc:
+            print(f"Tokenized cache load failed ({exc}); rebuilding.")
+            cache_hit = False
+
+    if not cache_hit:
+        cache_note = "and saving cache" if CACHE_TOKENIZED else "without caching"
+        print(f"Tokenized cache miss: building {cache_note}")
+        train_ds = train_ds.map(
+            tokenize_batch,
+            batched=True,
+            batch_size=MAP_BATCH_SIZE,
+            num_proc=num_proc if num_proc > 0 else None,
+            remove_columns=train_ds.column_names,
+            load_from_cache_file=False,
+            keep_in_memory=KEEP_IN_MEMORY,
+            fn_kwargs={"tokenizer": tok, "max_in": MAX_IN, "max_out": MAX_OUT},
+        )
+        val_ds = val_ds.map(
+            tokenize_batch,
+            batched=True,
+            batch_size=MAP_BATCH_SIZE,
+            num_proc=num_proc if num_proc > 0 else None,
+            remove_columns=val_ds.column_names,
+            load_from_cache_file=False,
+            keep_in_memory=KEEP_IN_MEMORY,
+            fn_kwargs={"tokenizer": tok, "max_in": MAX_IN, "max_out": MAX_OUT},
+        )
+        if CACHE_TOKENIZED:
+            try:
+                os.makedirs(train_cache_dir, exist_ok=True)
+                os.makedirs(val_cache_dir, exist_ok=True)
+                train_ds.save_to_disk(train_cache_dir)
+                val_ds.save_to_disk(val_cache_dir)
+                print(f"Tokenized cache saved to {cache_root}")
+            except Exception as exc:
+                print(f"Tokenized cache save failed ({exc}); continuing without cache.")
+
+    needed_columns = ["input_ids", "attention_mask", "labels"]
+    train_ds.set_format(type="torch", columns=needed_columns)
+    val_ds.set_format(type="torch", columns=needed_columns)
+
+    if PRETOKENIZE_ONLY:
+        print("PRETOKENIZE_ONLY=1, exiting after tokenization.")
+        return
+
     collator = DataCollatorForSeq2Seq(tok, model=model)
 
     args = Seq2SeqTrainingArguments(
@@ -136,7 +283,7 @@ def main():
     trainer = Seq2SeqTrainer(
         model=model,
         args=args,
-        train_dataset=ds,
+        train_dataset=train_ds,
         data_collator=collator,
         tokenizer=tok,
     )

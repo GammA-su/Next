@@ -73,10 +73,13 @@ Sentence-LM:
 - `BS`, `LR`, `STEPS`, `LOG_EVERY`, `OUT_DIR`
 
 Decoder:
+- `TRAIN_PATH`, `VAL_PATH`, `OUT_DIR`
 - `MODEL`, `MAX_IN`, `MAX_OUT`
 - `CODE_MODE` (`special`, `text`, `none`)
 - `K`, `V`, `ADD_SPECIAL_TOKENS`
 - `NUM_EPOCHS`, `LR`, `TRAIN_BS`, `MAX_ROWS`
+- `NUM_PROC`, `MAP_BATCH_SIZE`, `CACHE_TOKENIZED`, `TOKENIZED_CACHE_DIR`
+- `KEEP_IN_MEMORY`, `PRETOKENIZE_ONLY`
 
 Generation:
 - `GEN_STEPS`, `N_CAND`, `RERANK`
@@ -94,6 +97,20 @@ Set `CODE_MODE`:
 Notes:
 - `special` adds `K * V` tokens to the tokenizer and resizes the decoder embeddings.
 - If you change `K` or `V`, re-run `06_train_decoder.py` so token IDs and embeddings align.
+
+## Decoder tokenization cache
+
+Speed up the HuggingFace `map()` stage and reuse cached tokenized datasets:
+
+```bash
+NUM_PROC=16 CACHE_TOKENIZED=1 MAP_BATCH_SIZE=2000 uv run python 06_train_decoder.py
+```
+
+Build the tokenized cache and exit:
+
+```bash
+PRETOKENIZE_ONLY=1 NUM_PROC=16 CACHE_TOKENIZED=1 MAP_BATCH_SIZE=2000 uv run python 06_train_decoder.py
+```
 
 ## Evaluation scripts
 
